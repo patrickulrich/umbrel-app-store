@@ -1,8 +1,8 @@
 id: "pat"
-name: "SaulTeaFarmer's"
+name: "PatrickUlrich's"
 description: "Custom apps for testing"
-developer: "SaulTeaFarmer"
-website: "https://github.com/saulteafarmer/umbrel-app-store"
-submission: "https://github.com/saulteafarmer/umbrel-app-store"
+developer: "PatrickUlrich"
+website: "https://github.com/patrickulrich/umbrel-app-store"
+submission: "https://github.com/patrickulrich/umbrel-app-store"
 apps:
   - pat-discord-lnbits-bot

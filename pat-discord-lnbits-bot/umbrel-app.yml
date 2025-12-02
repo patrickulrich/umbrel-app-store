@@ -17,10 +17,10 @@ description: >-
   - Support for multiple Discord servers
   - QR code generation for easy mobile payments
   
-developer: SaulTeaFarmer
-website: https://github.com/saulteafarmer/umbrel-app-store
-repo: https://github.com/saulteafarmer/umbrel-app-store
-support: https://github.com/saulteafarmer/umbrel-app-store/issues
+developer: PatrickUlrich
+website: https://github.com/patrickulrich/umbrel-app-store
+repo: https://github.com/patrickulrich/umbrel-app-store
+support: https://github.com/patrickulrich/umbrel-app-store/issues
 port: 3050
 gallery:
   - https://relay.patrickulrich.com/bb8b0682059fdabed2c023d2ff25bf9e47100bd8d205a95730d59dd18beae34a.png

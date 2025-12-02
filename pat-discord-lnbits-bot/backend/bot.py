@@ -7,15 +7,30 @@ import qrcode
 import websockets
 import traceback
 import os
+import signal
 import logging
 from discord import File, Embed
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+# Import database module
+from database import (
+    init_db,
+    add_pending_invoice,
+    get_pending_invoice,
+    remove_pending_invoice,
+    get_all_pending_invoices,
+    cleanup_expired_invoices,
+    INVOICE_EXPIRY_HOURS
+)
 
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+# Graceful shutdown flag
+shutdown_event = asyncio.Event()
 
 # --- Configuration Loading ---
 DATA_DIR = os.environ.get('APP_DATA_DIR', '/app/data')
@@ -67,16 +82,24 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-pending_invoices = {}
+
+# Initialize database
+init_db()
+logging.info(f"Invoice expiry set to {INVOICE_EXPIRY_HOURS} hour(s)")
 
 async def assign_role_after_payment(payment_hash_received, payment_details_from_ws):
     logging.info(f"Processing payment for hash: {payment_hash_received}")
 
-    if payment_hash_received not in pending_invoices:
-        logging.info(f"Hash {payment_hash_received} not found in pending_invoices.")
+    # Look up invoice in database
+    invoice_data = get_pending_invoice(payment_hash_received)
+    if not invoice_data:
+        logging.info(f"Hash {payment_hash_received} not found in pending invoices.")
         return
 
-    user_id, original_interaction = pending_invoices.pop(payment_hash_received)
+    # Remove from database immediately to prevent double processing
+    remove_pending_invoice(payment_hash_received)
+
+    user_id = invoice_data['user_id']
     logging.info(f"Found pending invoice for user_id={user_id}")
 
     guild = bot.get_guild(GUILD_ID)
@@ -156,18 +179,53 @@ async def lnbits_websocket_listener():
             logging.error(f"WebSocket connection error: {e}. Retrying in 15s...")
             await asyncio.sleep(15)
 
+@tasks.loop(minutes=5)
+async def cleanup_expired_invoices_task():
+    """Periodically clean up expired invoices"""
+    try:
+        removed = cleanup_expired_invoices()
+        if removed > 0:
+            logging.info(f"Cleanup task removed {removed} expired invoice(s)")
+    except Exception as e:
+        logging.error(f"Error in cleanup task: {e}")
+
+
 @bot.event
 async def on_ready():
     logging.info(f"✅ Bot ready as {bot.user} ({bot.user.id})")
-    
+
     # Sync commands
     try:
         synced = await bot.tree.sync()
         logging.info(f"Synced {len(synced)} command(s)")
     except Exception as e:
         logging.error(f"Failed to sync commands: {e}")
-    
+
+    # Start periodic cleanup task
+    if not cleanup_expired_invoices_task.is_running():
+        cleanup_expired_invoices_task.start()
+        logging.info("Started invoice cleanup task (runs every 5 minutes)")
+
+    # Log any pending invoices from previous session
+    pending = get_all_pending_invoices()
+    if pending:
+        logging.info(f"Found {len(pending)} pending invoice(s) from previous session")
+
     bot.loop.create_task(lnbits_websocket_listener())
+
+def get_lnbits_error_message(status_code: int, response_text: str = "") -> str:
+    """Return user-friendly error message based on LNBits response."""
+    if status_code >= 500:
+        return f"❌ LNBits server error ({status_code}) - Lightning node may be disconnected. Please contact admin."
+    elif status_code == 401:
+        return "❌ LNBits authentication failed - invalid API key."
+    elif status_code == 403:
+        return "❌ LNBits permission denied - API key may not have invoice permission."
+    elif status_code == 404:
+        return "❌ LNBits endpoint not found - check server configuration."
+    else:
+        return f"❌ LNBits error ({status_code}). Please try again later."
+
 
 # Dynamic slash command
 @bot.tree.command(name=COMMAND_NAME, description="Pay to get your role via Lightning.")
@@ -180,30 +238,46 @@ async def dynamic_command(interaction: discord.Interaction):
     invoice_data = {"out": False, "amount": PRICE, "memo": f"Role for {interaction.user.display_name}"}
     headers = {"X-Api-Key": LNBITS_API_KEY, "Content-Type": "application/json"}
     loop = asyncio.get_running_loop()
-    
+
     try:
         resp = await loop.run_in_executor(None, lambda: requests.post(
-            f"{clean_lnbits_http_url}/api/v1/payments", json=invoice_data, headers=headers
+            f"{clean_lnbits_http_url}/api/v1/payments", json=invoice_data, headers=headers,
+            timeout=15
         ))
-        resp.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        await interaction.response.send_message(
+            "❌ Cannot connect to LNBits - check network configuration.", ephemeral=True
+        )
+        logging.error("Invoice creation failed: Connection error to LNBits")
+        return
+    except requests.exceptions.Timeout:
+        await interaction.response.send_message(
+            "❌ LNBits connection timed out - Lightning node may be slow.", ephemeral=True
+        )
+        logging.error("Invoice creation failed: Timeout connecting to LNBits")
+        return
     except Exception as e:
-        await interaction.response.send_message("❌ Could not create invoice. Try again later.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Could not create invoice. Please try again later.", ephemeral=True
+        )
         logging.error(f"Invoice creation error: {e}")
         return
 
     if resp.status_code != 201:
-        await interaction.response.send_message(f"❌ LNBits error ({resp.status_code}).", ephemeral=True)
-        logging.error(f"LNBits error response: {resp.text}")
+        error_msg = get_lnbits_error_message(resp.status_code, resp.text)
+        await interaction.response.send_message(error_msg, ephemeral=True)
+        logging.error(f"LNBits error response: {resp.status_code} - {resp.text}")
         return
 
     inv = resp.json()
     pr = inv.get("bolt11")
-    h  = inv.get("payment_hash")
+    h = inv.get("payment_hash")
     if not pr or not h:
-        await interaction.response.send_message("❌ Invalid invoice data.", ephemeral=True)
+        await interaction.response.send_message("❌ Invalid invoice data from LNBits.", ephemeral=True)
         return
 
-    pending_invoices[h] = (interaction.user.id, interaction)
+    # Store in database for persistence across restarts
+    add_pending_invoice(h, interaction.user.id, CHANNEL_ID)
     logging.info(f"Created invoice {h} for user {interaction.user.id}")
 
     buf = io.BytesIO()
@@ -229,6 +303,35 @@ async def dynamic_command(interaction: discord.Interaction):
         logging.error(f"Error sending invoice message: {e}")
         await interaction.response.send_message("❌ Failed to post invoice.", ephemeral=True)
 
+async def shutdown():
+    """Graceful shutdown handler"""
+    logging.info("Shutting down bot...")
+
+    # Stop the cleanup task
+    if cleanup_expired_invoices_task.is_running():
+        cleanup_expired_invoices_task.cancel()
+
+    # Close the bot connection
+    await bot.close()
+    logging.info("Bot shutdown complete")
+
+
+def handle_signal(sig, frame):
+    """Handle shutdown signals"""
+    logging.info(f"Received signal {sig}, initiating shutdown...")
+    asyncio.create_task(shutdown())
+
+
 if __name__ == "__main__":
     logging.info("Starting Discord Lightning Bot...")
-    bot.run(TOKEN)
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt")
+    finally:
+        logging.info("Bot process ended")
